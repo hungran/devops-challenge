@@ -54,6 +54,7 @@ if have nginx; then
     grep -rhE "$directives" /etc/nginx 2>/dev/null | sed 's/^\s*//' | sort -u
   fi
   for d in /var/log/nginx /var/lib/nginx /var/cache/nginx; do [[ -d $d ]] && du -sh "$d" 2>/dev/null; done
+  # shellcheck disable=SC2012  # human-readable listing for the operator, not parsed
   ls -lhS /var/log/nginx 2>/dev/null | head -10
 fi
 
