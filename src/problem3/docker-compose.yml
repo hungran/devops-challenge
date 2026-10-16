@@ -1,28 +1,79 @@
-version: "3.9"
+# `version:` removed - it is obsolete in Compose v2 and only produces a warning.
+name: problem3
 
 services:
   nginx:
-    image: nginx:1.25
+    image: nginx:1.25-alpine          # alpine variant ships busybox wget for the healthcheck
     ports:
       - "8080:80"
     volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
     depends_on:
-      - api
+      api:
+        condition: service_healthy    # FIX: don't route traffic before the API is ready
+    restart: unless-stopped           # FIX: no restart policy existed for any service
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
   api:
     build: ./api
+    init: true                        # PID 1 that forwards signals and reaps zombies
     environment:
-      - DB_HOST=postgres
-      - REDIS_HOST=redis
+      PORT: "3000"
+      DB_HOST: postgres
+      DB_USER: postgres
+      DB_NAME: postgres
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}   # FIX: no hardcoded secret
+      PG_POOL_MAX: "10"
+      REDIS_HOST: redis
+    expose:
+      - "3000"
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy    # FIX: plain depends_on only waits for "started"
+      redis:
+        condition: service_healthy
+    restart: unless-stopped           # FIX: a crashed API now comes back on its own
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ready >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256m
 
   postgres:
     image: postgres:15
     environment:
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    # FIX: connection limit is set explicitly here instead of the (unmounted)
+    # init.sql that would have capped it at 20.
+    command: ["postgres", "-c", "max_connections=100"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # FIX: data survived nothing before
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   redis:
     image: redis:7
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
