@@ -1,214 +1,141 @@
 # Problem 1 — Building Castle In The Cloud
 
-A highly available, scalable, cost-aware **spot-trading platform** (Binance-like) on AWS, sized for **500 requests/second** at **p99 < 100 ms**.
+A highly available, scalable and cost-effective **spot-trading platform** (Binance-like) on AWS.
+
+**Targets:** 500 requests/second, p99 response time < 100 ms.
 
 ## 1. Scope and assumptions
 
-**Features in scope.** I picked these because they exercise every hard infrastructure problem: ordering, consistency, low latency, fan-out and recovery.
+I chose a small set of features that still shows the key infrastructure concerns: ordering, consistency, real-time updates and failure handling.
 
-| Feature | Notes |
+| In scope | Out of scope |
 |---|---|
-| Sign-up / login / API keys | Web users (JWT) and programmatic traders (HMAC API keys) |
-| **Spot trading** | Limit and market orders, cancel, order status |
-| **Matching engine** | Price-time priority, per trading pair |
-| **Wallet / ledger** | Balances, funds locked on order placement, settlement on trade |
-| **Market data** | Order book depth, recent trades, candles (REST + WebSocket push) |
-| Order & trade history | Per user |
-
-**Out of scope:** on-chain deposits/withdrawals (custody, hot/cold wallets), futures/margin, fiat rails, KYC vendors, admin back-office. The design leaves clear seams for them (they consume or produce the same event stream).
+| Sign-up / login | Crypto deposits & withdrawals (wallet custody) |
+| Place / cancel limit and market orders | Futures, margin, fiat payments |
+| Order matching per trading pair (e.g. BTC/USDT) | KYC, admin back-office |
+| Account balances | |
+| Market data: order book, recent trades, prices (REST + WebSocket) | |
 
 **Assumptions**
-
-| # | Assumption |
-|---|---|
-| A1 | **500 RPS** is the HTTP API total. Assumed mix: 60% market-data reads, 30% order place/cancel, 10% account/history. **WebSocket** streams are measured separately (sized for ~20k concurrent connections at launch). |
-| A2 | **p99 < 100 ms is measured server-side** (ALB in → response out). Client internet RTT can't be controlled; users far from the region add their own RTT. |
-| A3 | Single primary region **ap-southeast-1 (Singapore)**, close to the Asian user base, with **3 Availability Zones**. |
-| A4 | The ledger must be **strongly consistent**: no double spend, no lost trade. Availability matters, but **correctness wins**. During some failures the system rejects new orders (503, retryable) rather than risk inconsistency. |
-| A5 | Launch with ~200 trading pairs; a handful (BTC/USDT, ETH/USDT) carry most volume. |
+- 500 RPS is the total HTTP API load. Roughly 60% is market-data reads, 30% order placement/cancellation and 10% account queries.
+- p99 < 100 ms is measured at the server (load balancer in → response out). Internet latency to the user is outside our control.
+- One AWS region, Singapore (`ap-southeast-1`), with 3 Availability Zones (AZs).
+- **Balances must never be wrong.** If something fails, the system should reject new orders (the client can retry) rather than risk an incorrect balance.
 
 ## 2. Architecture overview
 
 ```mermaid
 flowchart TB
-  U["Web / mobile users<br/>API traders"] --> R53["Route 53<br/>DNS + health checks"]
-  R53 --> CF["CloudFront<br/>static SPA + cached public market data"]
-  R53 --> ALB
-  CF --> S3W[("S3<br/>web app")]
-  CF --> ALB["Application Load Balancer<br/>HTTPS + WebSocket, 3 AZs"]
+  U["Users (web / mobile / API)"] --> R53["Route 53 (DNS)"]
+  R53 --> CF["CloudFront + AWS WAF"]
+  CF --> S3[("S3<br/>web frontend")]
+  CF --> ALB["Application Load Balancer<br/>HTTPS + WebSocket"]
 
-  subgraph VPC["VPC · 3 AZs · private subnets"]
-    subgraph EKS["Amazon EKS (Karpenter, Graviton)"]
-      GW["API Gateway svc<br/>auth · rate limit · routing"]
-      WS["WebSocket Gateway<br/>market + user streams"]
-      ORD["Order svc<br/>validate · risk · lock funds"]
-      QRY["Query svc<br/>orders · trades · balances (read)"]
-      MD["Market Data svc<br/>depth · trades · candles"]
-      LED["Ledger / Settlement svc"]
-      ACC["Account svc<br/>users · API keys"]
+  subgraph VPC["VPC across 3 Availability Zones"]
+    subgraph EKS["Amazon EKS cluster"]
+      API["API service<br/>orders · accounts · market data"]
+      WS["WebSocket service<br/>live prices & order updates"]
+      ME["Matching service<br/>matches orders per trading pair"]
     end
-    subgraph ME["Matching Engine (dedicated EC2 node group)"]
-      MEA["Engine shard N<br/>ACTIVE (AZ-a)"]
-      MES["Engine shard N<br/>HOT STANDBY (AZ-b)"]
-    end
-    MSK[["Amazon MSK (Kafka)<br/>orders · executions · market events<br/>RF=3 across AZs"]]
-    AUR[("Aurora PostgreSQL<br/>writer + 2 readers, Multi-AZ<br/>ledger · orders · accounts")]
-    RED[("ElastiCache Redis<br/>cluster mode, Multi-AZ<br/>books · candles · rate limits · pub/sub")]
+    Q[["SQS FIFO queue<br/>orders, grouped by trading pair"]]
+    DB[("Aurora PostgreSQL Multi-AZ<br/>users · balances · orders · trades")]
+    RC[("ElastiCache Redis<br/>order book · prices · pub/sub")]
   end
 
-  COG["Cognito<br/>user auth + MFA"]
-  S3S[("S3<br/>engine snapshots · event archive · audit")]
-  OBS["CloudWatch · Managed Prometheus/Grafana · X-Ray"]
+  COG["Amazon Cognito<br/>login + MFA"]
+  CW["CloudWatch<br/>metrics · logs · alarms"]
 
-  ALB --> GW & WS
-  GW --> ORD & QRY & MD & ACC
-  ACC --> COG
-  ORD -- "1. lock funds (ACID)" --> AUR
-  ORD -- "2. append order cmd" --> MSK
-  MSK -- "ordered per pair" --> MEA
-  MSK -. "same stream, replay" .-> MES
-  MEA -- "executions / book deltas" --> MSK
-  MEA -. "periodic snapshot" .-> S3S
-  MSK --> LED --> AUR
-  MSK --> MD --> RED
-  RED --> WS
-  MSK --> WS
-  QRY --> AUR
-  QRY --> RED
-  MSK -. "archive" .-> S3S
+  ALB --> API
+  ALB --> WS
+  API --> COG
+  API -- "1. reserve funds + save order" --> DB
+  API -- "2. send order" --> Q
+  Q -- "3. in order, per pair" --> ME
+  ME -- "4. save trades + update balances" --> DB
+  ME -- "5. publish book & trade updates" --> RC
+  RC --> WS
+  API -- "read prices / order book" --> RC
 ```
 
-### Order lifecycle (the critical path)
+### How an order flows
 
-```mermaid
-sequenceDiagram
-  autonumber
-  participant C as Client
-  participant G as API GW svc
-  participant O as Order svc
-  participant DB as Aurora (ledger)
-  participant K as MSK (orders.{pair})
-  participant M as Matching engine
-  participant L as Ledger svc
-  participant W as WS gateway
-  C->>G: POST /orders (JWT / HMAC, clientOrderId)
-  G->>O: validated request
-  O->>DB: TX: lock funds (available -= x, locked += x, only if available >= x)<br/>+ insert order (unique clientOrderId = idempotency)
-  O->>K: produce OrderCommand (acks=all)
-  O-->>C: 201 ACCEPTED {orderId}   (≈15–30 ms server-side)
-  K->>M: consume in strict sequence
-  M->>M: match in memory (µs)
-  M->>K: Execution / BookDelta events
-  K->>L: consume: settle trade (double-entry, idempotent by eventId)
-  L->>DB: COMMIT balances
-  K->>W: push fills + book updates to subscribers
-```
+1. The user sends an order. The **API service** checks the login token and request limits.
+2. In one database transaction, it **reserves the funds** (balance must be enough) and saves the order with status `NEW`. A unique client order ID prevents duplicates if the user retries.
+3. It sends the order to the **SQS FIFO queue**. The message group is the trading pair, so orders for BTC/USDT are always processed in the order they arrived.
+4. The API returns `accepted` to the user. The work so far is a DB transaction plus a queue send, roughly 20–40 ms.
+5. The **Matching service** takes orders from the queue one by one per pair and matches them against the in-memory order book. It saves the trades and updated balances to Aurora in one transaction.
+6. It publishes order-book and trade updates to **Redis**. The **WebSocket service** pushes them to connected users, including "your order was filled".
 
-**Latency budget for `POST /orders` (p99, server-side):**
+## 3. Why each service, and alternatives considered
 
-| Step | Budget |
-|---|---|
-| ALB + API gateway service (auth, rate limit in Redis) | ~5 ms |
-| Order service validation + Aurora transaction (single-row conditional update + insert) | ~10 ms |
-| Kafka produce, `acks=all`, cross-AZ replication | ~10 ms |
-| Headroom (GC, network jitter, retries) | ~30 ms |
-| **Total target** | **≈ 55 ms, comfortably under 100 ms** |
-
-Market-data reads hit Redis (~1–2 ms) or are served from CloudFront for public endpoints, so they sit far below the budget. The engine itself matches in microseconds; the asynchronous hop to a fill notification typically takes 10–30 ms.
-
-## 3. Why each service — and what I considered instead
-
-| Role | Choice | Why | Alternatives considered |
+| Need | Choice | Why | Alternatives considered |
 |---|---|---|---|
-| DNS / failover | **Route 53** | Health-checked records; enables the DR failover in §5 | — |
-| Edge / static | **CloudFront + S3** | Serves the SPA globally. Caches public market-data REST (`/depth`, `/ticker`) for 0.5–1 s, absorbing bursts without touching the cluster | Serving static files from the cluster: more cost, worse latency |
-| Ingress | **ALB** | Native WebSocket, path routing, cheap at steady 500 RPS, integrates with WAF/ACM | **API Gateway**: adds latency and per-request cost; WebSocket API has connection-duration limits that hurt long-lived market streams. **NLB**: lowest latency but no L7 routing; worth adding later for a dedicated FIX/WS endpoint for market makers |
-| Compute (stateless services) | **EKS + Karpenter on Graviton** | One platform for ~8 services; HPA + Karpenter scale in seconds; Graviton ≈ 20–40% cheaper; portable; mature GitOps (Argo CD) | **ECS Fargate**: simpler ops, but less control over placement/node types (which the engine needs) and pricier per vCPU at steady load. **Lambda**: cold starts and per-invoke cost wrong for a latency-critical steady workload |
-| Matching engine | **Dedicated EC2 node group** (c7g, compute-optimised), **single-threaded per pair shard**, active + hot standby in another AZ | Matching must be **sequential per pair** for price-time fairness; in-memory and single-threaded is the industry pattern (LMAX). Deterministic: replaying the same command stream gives the same book, so a standby that consumes the same partition can take over at the last offset | Matching in the database (row locks): far too slow under contention. Multi-threaded engine: harder to make correct and deterministic |
-| Event backbone | **Amazon MSK (Kafka)**, 3 brokers / 3 AZs, RF=3, `min.insync.replicas=2` | **Total order per partition** (partition = trading pair), durable replayable log (engine recovery, rebuilding read models, audit), single-digit-ms produce latency, high throughput headroom | **Kinesis**: polling-based consumers add tens of ms of latency; per-shard limits. **SQS FIFO**: no replay, throughput caps per message group. **Self-managed Kafka/Redpanda on EC2**: cheaper at scale, but ops burden at launch |
-| System of record | **Aurora PostgreSQL**, Multi-AZ (1 writer + 2 readers) | ACID transactions for the ledger (double-entry, conditional updates, unique constraints for idempotency); failover typically < 30 s; readers serve history queries; storage auto-grows across 3 AZs | **DynamoDB**: superb scale, but multi-item transactions are limited and costlier, and relational ledger queries/audits get awkward. **RDS PostgreSQL Multi-AZ**: cheaper, but slower failover and no fast read replicas on shared storage |
-| Cache / real-time state | **ElastiCache for Redis** (cluster mode, Multi-AZ) | Order book snapshots, candles, rate-limit counters, pub/sub fan-out to WS gateways, sub-ms latency. All state is **rebuildable from Kafka**, so durability isn't required | **MemoryDB**: durable Redis; unnecessary since Kafka is the source of truth. **DAX**: DynamoDB-only |
-| Identity | **Cognito** for user auth + MFA; API keys (HMAC) in the Account service backed by Aurora | Offloads password storage, MFA, brute-force protection | Auth0/Okta (third-party dependency + cost), self-built auth (risk) |
-| Snapshots / archive | **S3** | Engine snapshots (fast restart: snapshot + replay since offset), Kafka archive, audit logs; lifecycle to Glacier | EFS: pricier, no lifecycle tiers needed |
-| Observability | **CloudWatch, Amazon Managed Prometheus + Grafana, X-Ray/OpenTelemetry** | SLO dashboards (p99 per endpoint, Kafka consumer lag, engine sequence gap), alerting | Self-hosted Prometheus/Grafana: more ops; Datadog: excellent but cost scales with hosts |
-| Delivery | GitHub Actions → ECR → **Argo CD** (GitOps); Terraform for infra | Reproducible, auditable, easy rollback (see Problem 4) | — |
+| DNS | Route 53 | Health checks and failover | — |
+| Frontend + edge | CloudFront + S3 | Fast global delivery of the web app. Short caching (1 s) of public market data absorbs traffic spikes | Serving the frontend from the cluster (more load, higher cost) |
+| Web protection | AWS WAF | Blocks common attacks and bots, rate-limits abusive IPs | Third-party CDN/WAF |
+| Load balancer | ALB | Supports HTTPS and WebSocket, spreads traffic across AZs, low cost at 500 RPS | API Gateway: adds latency and per-request cost, and limits WebSocket connection duration |
+| Compute | **Amazon EKS** | One platform for all services, auto-scaling (HPA + Karpenter), rolling deployments, and a skill set the team already has | **ECS Fargate**: simpler and also a good fit. EKS chosen for flexibility and team familiarity. **Lambda**: cold starts are a poor fit for steady, latency-sensitive traffic |
+| Order queue | **SQS FIFO** | Fully managed. Keeps **strict order per trading pair** (message group). High-throughput mode handles far more than 500 RPS. No servers to operate | **Kafka (MSK)**: more powerful (replay, higher throughput) but more to operate. Planned for when we outgrow SQS (see §5) |
+| Database | **Aurora PostgreSQL** (1 writer + 1 reader, Multi-AZ) | ACID transactions keep balances correct. Automatic failover (usually < 30 s). Storage replicated across 3 AZs | DynamoDB: scales well, but multi-row transactions for balances are harder. RDS PostgreSQL: cheaper, but slower failover |
+| Cache / real-time | **ElastiCache Redis** (Multi-AZ) | Sub-millisecond reads for prices and order book; pub/sub to push updates to WebSocket pods; rate-limit counters | MemoryDB: durable but unnecessary, since cache data can be rebuilt |
+| Login | Amazon Cognito | Managed sign-up/login, MFA, password security | Building our own auth (risky) |
+| Monitoring | CloudWatch (+ Container Insights) | Metrics, logs, alarms and dashboards in one place | Prometheus/Grafana, Datadog |
 
-### Networking
+**Network layout:**
+- **Public subnets:** only the ALB and NAT gateways.
+- **Private subnets:** EKS nodes, Aurora, Redis. No direct internet access.
+- **VPC endpoints:** for S3, SQS, ECR and CloudWatch, so traffic to AWS services stays private and NAT costs stay low.
 
-- One VPC, 3 AZs. **Public subnets**: ALB and NAT gateways only. **Private app subnets**: EKS nodes and the engine. **Isolated data subnets**: Aurora, MSK and Redis, with no route to the internet.
-- **VPC endpoints** (S3, ECR, STS, Secrets Manager, CloudWatch) keep AWS traffic off NAT. This is cheaper and more secure.
-- Topology-aware routing in EKS keeps calls within the AZ where possible, which cuts latency and cross-AZ data charges.
+## 4. High availability
 
-## 4. How it stays highly available
+Everything runs in **3 Availability Zones**. Each service runs at least 2–3 copies spread across AZs.
 
-| Failure | What happens | Impact |
+| Failure | What happens |
+|---|---|
+| A pod or server fails | Kubernetes restarts it on a healthy node; the other copies keep serving |
+| A whole AZ fails | ALB stops sending traffic there. Aurora fails over to a reader in another AZ. Redis promotes a replica. EKS starts replacement pods in the remaining AZs |
+| Matching service crashes | Another pod takes over. It rebuilds the order book from the open orders saved in Aurora. Orders waiting in SQS are not lost; they are simply processed when matching resumes |
+| Database failover (~30 s) | New orders get a "try again" response (HTTP 503). No balance is ever left in a wrong state, because every change is one transaction |
+| Bad deployment | Rolling update with health checks; automatic rollback if error rate or latency rises |
+| Whole region fails | Backups and an Aurora cross-region replica in a second region (e.g. Tokyo). Recovery is manual (RTO ~1 hour), because running two order books at once would be unsafe |
+
+**Why this meets p99 < 100 ms:**
+- Order placement: one database transaction + one queue send, roughly 20–40 ms.
+- Market-data reads: served from Redis or the CloudFront cache in a few milliseconds.
+- **How I'd verify it:** load testing at 3× the expected traffic, and monitoring p99 per endpoint in production.
+
+## 5. Scaling plan
+
+Scaling decisions are driven by metrics:
+- p99 latency
+- CPU usage
+- SQS queue age (how long orders wait)
+- Aurora CPU and connections
+- number of WebSocket connections
+
+| Stage | Load | Changes |
 |---|---|---|
-| A pod / node dies | Kubernetes reschedules; ≥3 replicas per stateless service spread across AZs (topology spread + PodDisruptionBudgets) | None visible |
-| **A whole AZ fails** | ALB stops routing there; Karpenter adds capacity in the remaining AZs; MSK keeps quorum (2 of 3); Aurora fails over to a reader in another AZ; Redis promotes a replica; the engine **standby in another AZ becomes active** | Seconds of elevated latency; in-flight order requests may need a client retry (idempotent via `clientOrderId`) |
-| **Matching engine crash** | Standby already consumed the same partition and holds the identical book. It takes over leadership (single-writer lease) and continues from the last committed offset. A cold restart = load latest S3 snapshot + replay Kafka from its offset | ~1–5 s pause in matching for affected pairs; no lost orders |
-| Aurora writer failover | New orders get a fast, retryable `503` (circuit breaker) for the failover window (typically < 30 s). Matching and market data keep running; settlement consumers pause and resume from their Kafka offsets | Short order-entry pause; ledger stays consistent |
-| Kafka broker loss | RF=3 + `min.insync.replicas=2`: producers/consumers continue | None visible |
-| Redis node loss | Replica promoted; caches rebuilt from Kafka | Brief cache misses |
-| Bad deploy | Canary/rolling with automated rollback on SLO burn (Argo Rollouts); engine releases use the standby: upgrade standby → verify replay determinism → switch | Contained |
-| **Region loss** | DR to a **warm standby region** (e.g., ap-northeast-1): Aurora Global Database (RPO ~1 s), MSK Replicator for the event log, Terraform-provisioned scaled-down EKS. **Failover is a deliberate, manual decision**: an exchange must not run split-brain with two order books | Trading halted until failover (RTO target ~30 min); RPO ~seconds |
+| **Now** | 500 RPS | Design above |
+| **Growth** | ~5,000 RPS | Scale pods horizontally (HPA + Karpenter). Run several matching pods, each handling a set of trading pairs. Add Aurora read replicas + RDS Proxy for connection pooling. Scale Redis with more shards. Cache more public data at CloudFront |
+| **Large scale** | 50,000+ RPS | Replace SQS with **Kafka (MSK)** for higher throughput and replay. Split the database (e.g. by user ID) when a single writer becomes the limit. Consider a multi-region setup for read-only market data |
 
-**Design principles behind this**
-- **Single source of truth = the event log.** Every read model (order books, candles, history, balances cache) can be rebuilt by replay.
-- **Idempotency everywhere.** `clientOrderId` on writes; `eventId` dedupe in consumers. Retries are always safe.
-- **Backpressure and graceful degradation.** Rate limits per user/API key at the gateway, circuit breakers, and shedding of non-critical work (history, candles) before order entry.
+## 6. Cost estimate (rough)
 
-## 5. Cost-effectiveness
-
-500 RPS is modest. The design targets **steady, right-sized capacity with headroom**, not huge fleets.
-
-| Component | Launch size | Approx. monthly (on-demand, ap-southeast-1) |
+| Component | Size | ~ USD / month |
 |---|---|---|
-| EKS control plane | 1 cluster | ~$75 |
-| App nodes | 6 × m7g.large (2 per AZ), Karpenter-managed | ~$400 |
-| Matching engine | 2 × c7g.xlarge (active + standby) | ~$230 |
-| MSK | 3 × kafka.m7g.large + storage | ~$650 |
-| Aurora PostgreSQL | 3 × db.r7g.large (I/O-Optimized) | ~$950 |
-| ElastiCache Redis | 3 × cache.r7g.large (primary + replicas) | ~$550 |
-| ALB, NAT (3), CloudFront, data transfer | — | ~$300 |
-| Observability, logs, S3, Secrets, KMS | — | ~$300 |
-| **Total** | | **≈ $3.5k / month** (≈ $2.4k with 1-yr Savings Plans / RIs) |
+| EKS cluster + 6 worker nodes (Graviton, m7g.large) | 2 nodes per AZ | ~500 |
+| Aurora PostgreSQL | 2 × db.r7g.large | ~600 |
+| ElastiCache Redis | 2 × cache.r7g.large | ~400 |
+| ALB, NAT gateways, CloudFront, WAF, data transfer | — | ~350 |
+| SQS, Cognito, S3, CloudWatch | — | ~150 |
+| **Total** | | **~2,000** |
 
-> Rough order of magnitude for planning. I'd confirm with the AWS Pricing Calculator and real load tests.
+These are rough on-demand figures for planning. I'd confirm them with the AWS Pricing Calculator.
 
-**Levers:**
-- **Graviton** everywhere.
-- **Compute Savings Plans** for the steady baseline.
-- **Spot** for stateless, interruption-tolerant workloads only (candle builders, history projections). Never for the engine, ledger or gateways.
-- **Tiered storage** for Kafka; S3 lifecycle rules.
-- **CloudFront caching** of public market data.
-- **VPC endpoints** to cut NAT data charges.
-- Scale-to-baseline overnight for non-trading services.
+**Ways to reduce cost:**
+- Graviton instances.
+- Savings Plans for steady capacity (~30% lower).
+- Scaling down non-critical services at night.
+- VPC endpoints to cut NAT data charges.
 
-## 6. Scaling beyond the current setup
-
-Scale is driven by **signals**, not guesses:
-- p99 latency per endpoint
-- CPU > 60% sustained
-- Kafka consumer lag
-- engine queue depth / matching latency
-- Aurora CPU and commit latency
-- Redis memory
-- WebSocket connections per pod
-
-| Stage | Load | What changes |
-|---|---|---|
-| **1 — Launch** (this design) | 500 RPS, ~20k WS | As above |
-| **2 — Growth** | ~5k RPS, ~200k WS | **Horizontal** scaling of stateless services (HPA + Karpenter). More Kafka **partitions**, with pairs spread across **more engine shards** (each shard owns a set of pairs; hot pairs like BTC/USDT get a dedicated shard). **RDS Proxy** + more Aurora readers. Redis shards. A separate WS gateway fleet behind an NLB with fan-out through Redis/Kafka. Longer CloudFront caching of public data. |
-| **3 — Scale-out** | ~50k RPS, millions of WS | **Shard the ledger by account ID** (multiple Aurora clusters behind a routing layer, or a distributed SQL engine), since the single writer becomes the bottleneck. **Cell-based architecture**: independent cells of gateways, order services and ledger shards, limiting the blast radius. Engine hosts move to **cluster placement groups** with low-latency tuning (CPU pinning, kernel bypass). A dedicated **FIX / colocation-style endpoint** for market makers. Read-only market data replicated to **edge regions** for global users. |
-| **4 — Global** | Multi-region | Active-active for non-trading services (accounts, market data distribution). Order books stay **single-homed per trading pair** (a pair's book lives in one region) to preserve strict ordering. Users are routed by latency, and order entry is forwarded to the home region of the pair. |
-
-**What I would load-test before launch:**
-- 3× the expected peak (1,500 RPS)
-- a 10× burst on a single hot pair
-- AZ evacuation (kill an AZ during load)
-- engine failover during load
-- Aurora failover during load
-
-Each one is checked against the p99 SLO and zero ledger discrepancies, the latter verified by a reconciliation job that recomputes balances from the event log.
-
-Security is woven into this design in **Problem 5**.
+Security for this design is covered in **Problem 5**.
