@@ -1,0 +1,154 @@
+# Reusable: deploy one frontend version to one environment.
+#
+# GitHub Environment vars:
+#   AWS_REGION, AWS_DEPLOY_ROLE_ARN, ARTIFACT_BUCKET,
+#   SITE_BUCKET, CLOUDFRONT_DISTRIBUTION_ID, SITE_URL, FRONTEND_API_BASE_URL
+name: _deploy-frontend
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+      artifact:
+        description: GitHub artifact to publish to S3 first; empty = fetch an existing release from S3.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: ${{ inputs.environment }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.SITE_URL }}
+    concurrency:
+      group: deploy-frontend-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ inputs.version }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      SITE_BUCKET: ${{ vars.SITE_BUCKET }}
+      CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+      SITE_URL: ${{ vars.SITE_URL }}
+      API_BASE_URL: ${{ vars.FRONTEND_API_BASE_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Validate inputs
+        run: |
+          [[ "$VERSION" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::version must be a full git SHA"; exit 1; }
+
+      - name: Download build artifact
+        if: inputs.artifact != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact }}
+          path: release
+
+      - name: Configure AWS credentials (OIDC, short-lived)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-frontend-${{ inputs.environment }}-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Store release in artifact bucket (immutable)
+        if: inputs.artifact != ''
+        run: |
+          set -euo pipefail
+          (cd release && sha256sum -c "frontend-${VERSION}.tgz.sha256")
+          for f in "frontend-${VERSION}.tgz" "frontend-${VERSION}.tgz.sha256"; do
+            if aws s3api put-object --bucket "$ARTIFACT_BUCKET" --key "frontend/$f" \
+                 --body "release/$f" --if-none-match '*' >/dev/null 2>err.txt; then
+              echo "Uploaded frontend/$f"
+            elif grep -q PreconditionFailed err.txt; then
+              echo "frontend/$f already exists, reusing"
+            else
+              cat err.txt; exit 1
+            fi
+          done
+
+      - name: Fetch release from artifact bucket
+        if: inputs.artifact == ''
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for f in "frontend-${VERSION}.tgz" "frontend-${VERSION}.tgz.sha256"; do
+            aws s3 cp "s3://$ARTIFACT_BUCKET/frontend/$f" "release/$f" --only-show-errors \
+              || { echo "::error::frontend/$f not found - was this SHA ever built on main?"; exit 1; }
+          done
+          (cd release && sha256sum -c "frontend-${VERSION}.tgz.sha256")
+
+      - name: Unpack and render environment config
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          tar -xzf "release/frontend-${VERSION}.tgz" -C site
+          jq -n --arg api "$API_BASE_URL" --arg env "$ENVIRONMENT" \
+            '{apiBaseUrl:$api, environment:$env}' > site/config.json
+          [[ "$(jq -r .version site/version.json)" == "$VERSION" ]] \
+            || { echo "::error::artifact version mismatch"; exit 1; }
+
+      - name: Record currently live version (rollback target)
+        id: previous
+        run: |
+          prev=$(curl -fsS --max-time 5 "${SITE_URL}/version.json" | jq -r '.version // empty' || true)
+          [[ "$prev" =~ ^[0-9a-f]{40}$ ]] || prev=""
+          echo "version=${prev}" >> "$GITHUB_OUTPUT"
+          echo "Currently live: ${prev:-<none>}"
+
+      - name: Publish to S3 + invalidate CloudFront
+        run: ./scripts/publish-frontend.sh site
+
+      - name: Smoke test through CloudFront
+        id: smoke
+        run: |
+          set -euo pipefail
+          # The entry chunk referenced by index.html must be reachable too.
+          asset=$(grep -oE '/assets/[^"]+\.js' site/index.html | head -1)
+          ./scripts/smoke-test.sh "${SITE_URL}/version.json" "$VERSION" \
+            "${SITE_URL}/" "${SITE_URL}/config.json" "${SITE_URL}${asset}"
+
+      - name: Roll back to previous version
+        if: failure() && steps.smoke.outcome == 'failure' && steps.previous.outputs.version != ''
+        env:
+          PREVIOUS: ${{ steps.previous.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "::warning::Smoke test failed, rolling back to ${PREVIOUS}"
+          rm -rf rollback && mkdir -p rollback
+          aws s3 cp "s3://$ARTIFACT_BUCKET/frontend/frontend-${PREVIOUS}.tgz" rollback.tgz --only-show-errors
+          tar -xzf rollback.tgz -C rollback
+          jq -n --arg api "$API_BASE_URL" --arg env "$ENVIRONMENT" \
+            '{apiBaseUrl:$api, environment:$env}' > rollback/config.json
+          ./scripts/publish-frontend.sh rollback
+          ./scripts/smoke-test.sh "${SITE_URL}/version.json" "$PREVIOUS"
+
+      - name: Summary
+        if: always()
+        env:
+          PREVIOUS: ${{ steps.previous.outputs.version }}
+          STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### Frontend → ${ENVIRONMENT}"
+            echo "| | |"; echo "|---|---|"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Previous | \`${PREVIOUS:-n/a}\` |"
+            echo "| Result | ${STATUS} |"
+          } >> "$GITHUB_STEP_SUMMARY"

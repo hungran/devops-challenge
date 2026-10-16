@@ -1,0 +1,40 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadReleaseBundles",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:GetObjectVersion"],
+      "Resource": "arn:aws:s3:::example-release-artifacts/backend/*"
+    },
+    {
+      "Sid": "PublishReleaseBundlesStagingOnly",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject"],
+      "Resource": "arn:aws:s3:::example-release-artifacts/backend/*"
+    },
+    {
+      "Sid": "DeployToThisEnvironmentOnly",
+      "Effect": "Allow",
+      "Action": [
+        "codedeploy:CreateDeployment",
+        "codedeploy:GetDeployment",
+        "codedeploy:GetDeploymentGroup",
+        "codedeploy:ListDeploymentTargets",
+        "codedeploy:GetDeploymentTarget",
+        "codedeploy:StopDeployment"
+      ],
+      "Resource": [
+        "arn:aws:codedeploy:ap-southeast-1:111111111111:application:backend",
+        "arn:aws:codedeploy:ap-southeast-1:111111111111:deploymentgroup:backend/backend-staging",
+        "arn:aws:codedeploy:ap-southeast-1:111111111111:deploymentconfig:*"
+      ]
+    },
+    {
+      "Sid": "RegisterRevision",
+      "Effect": "Allow",
+      "Action": ["codedeploy:RegisterApplicationRevision", "codedeploy:GetApplicationRevision"],
+      "Resource": "arn:aws:codedeploy:ap-southeast-1:111111111111:application:backend"
+    }
+  ]
+}

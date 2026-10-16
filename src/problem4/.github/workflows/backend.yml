@@ -1,0 +1,184 @@
+# Backend: HTTP API -> EC2 (via S3 release bundle + AWS CodeDeploy)
+#
+#   PR:            test + security scan                (no AWS access at all)
+#   push to main:  test + scan -> build once -> staging -> [approval] -> production
+#   manual:        (re)deploy an already-built SHA to an environment (rollback)
+name: backend
+
+on:
+  pull_request:
+    paths: &paths
+      - "backend/**"
+      - "scripts/smoke-test.sh"
+      - "scripts/deploy-backend.sh"
+      - ".github/workflows/backend.yml"
+      - ".github/workflows/_deploy-backend.yml"
+  push:
+    branches: [main]
+    paths: *paths
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [staging, production]
+        required: true
+      version:
+        description: Full 40-char git SHA of a build that already exists in the artifact bucket
+        type: string
+        required: true
+
+# Least privilege by default; jobs opt in to more.
+permissions:
+  contents: read
+
+concurrency:
+  # Superseded PR runs are cancelled; main-branch runs queue so deploys are ordered.
+  group: backend-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  test:
+    name: Lint & test
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test # includes an 80% line-coverage gate
+      - name: Dependency audit (runtime deps)
+        run: npm audit --omit=dev --audit-level=high
+
+  security-scan:
+    name: Security scan
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Trivy (vulnerabilities, secrets, misconfig)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: backend
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  build:
+    name: Build release bundle
+    needs: [test, security-scan]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write      # signing the provenance attestation
+      attestations: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      artifact: ${{ steps.meta.outputs.artifact }}
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - id: meta
+        run: |
+          echo "version=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "artifact=backend-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Install production dependencies only
+        run: npm ci --omit=dev
+      - name: Assemble bundle
+        # The bundle is self-contained (node_modules included) so EC2 hosts never
+        # run `npm install` and never need outbound access to the npm registry.
+        run: |
+          set -euo pipefail
+          out=dist/bundle
+          mkdir -p "$out"
+          cp -r src package.json package-lock.json node_modules "$out/"
+          cp deploy/appspec.yml deploy/backend.service "$out/"
+          cp -r deploy/scripts "$out/scripts"
+          chmod +x "$out"/scripts/*.sh
+          jq -n --arg v "$GITHUB_SHA" --arg ref "$GITHUB_REF" --arg run "$GITHUB_RUN_ID" \
+                --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '{version:$v, ref:$ref, runId:$run, builtAt:$at}' > "$out/build-info.json"
+          tar -czf "dist/backend-${GITHUB_SHA}.tgz" -C "$out" .
+          sha256sum "dist/backend-${GITHUB_SHA}.tgz" | tee "dist/backend-${GITHUB_SHA}.tgz.sha256"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: backend/dist/backend-${{ github.sha }}.tgz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.meta.outputs.artifact }}
+          path: |
+            backend/dist/backend-${{ github.sha }}.tgz
+            backend/dist/backend-${{ github.sha }}.tgz.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+  # Deploy jobs are skipped until the repo variable DEPLOY_ENABLED is "true",
+  # so CI stays green in forks / before AWS is wired up.
+  deploy-staging:
+    name: Deploy to staging
+    needs: build
+    if: github.event_name == 'push' && vars.DEPLOY_ENABLED == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-backend.yml
+    with:
+      environment: staging
+      version: ${{ needs.build.outputs.version }}
+      artifact: ${{ needs.build.outputs.artifact }}
+
+  deploy-production:
+    name: Deploy to production
+    needs: [build, deploy-staging]
+    # The `production` GitHub Environment has required reviewers + a main-only
+    # branch policy, so this job pauses for human approval.
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-backend.yml
+    with:
+      environment: production
+      version: ${{ needs.build.outputs.version }}
+      artifact: "" # promote the exact bytes staging uploaded to S3; never rebuild
+
+  manual-deploy:
+    name: Manual deploy / rollback
+    if: github.event_name == 'workflow_dispatch' && vars.DEPLOY_ENABLED == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-backend.yml
+    with:
+      environment: ${{ inputs.environment }}
+      version: ${{ inputs.version }}
+      artifact: ""

@@ -1,0 +1,29 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReleaseArtifacts",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::example-release-artifacts/frontend/*"
+    },
+    {
+      "Sid": "PublishSite",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::example-site-staging/*"
+    },
+    {
+      "Sid": "ListSiteForSync",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::example-site-staging"
+    },
+    {
+      "Sid": "InvalidateThisDistributionOnly",
+      "Effect": "Allow",
+      "Action": ["cloudfront:CreateInvalidation", "cloudfront:GetInvalidation"],
+      "Resource": "arn:aws:cloudfront::111111111111:distribution/E2EXAMPLESTAGING"
+    }
+  ]
+}

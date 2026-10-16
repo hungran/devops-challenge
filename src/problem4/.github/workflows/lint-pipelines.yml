@@ -1,0 +1,34 @@
+# The pipelines are code too: lint workflows and deploy scripts on every change.
+name: lint-pipelines
+
+on:
+  pull_request:
+    paths: &paths
+      - ".github/**"
+      - "scripts/**"
+      - "backend/deploy/**"
+  push:
+    branches: [main]
+    paths: *paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-pipelines-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint (also runs shellcheck on every `run:` block)
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+      - name: shellcheck deploy scripts
+        run: shellcheck --severity=warning scripts/*.sh backend/deploy/scripts/*.sh

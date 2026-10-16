@@ -1,0 +1,5 @@
+# Changes to how we ship require a platform review (enforced via branch protection).
+/.github/            @your-org/platform
+/scripts/            @your-org/platform
+/backend/deploy/     @your-org/platform
+/infra/              @your-org/platform

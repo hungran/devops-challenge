@@ -1,0 +1,36 @@
+[Unit]
+Description=Backend HTTP API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=backend
+Group=backend
+WorkingDirectory=/opt/backend/current
+# Runtime config/secrets are rendered onto the instance at boot from SSM
+# Parameter Store / Secrets Manager (instance role). Never shipped in the bundle.
+EnvironmentFile=-/etc/backend/backend.env
+Environment=NODE_ENV=production PORT=8080
+ExecStart=/usr/bin/env node src/server.js
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+KillSignal=SIGTERM
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

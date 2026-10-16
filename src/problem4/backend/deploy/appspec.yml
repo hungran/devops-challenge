@@ -1,0 +1,25 @@
+# AWS CodeDeploy (EC2/on-prem) application specification.
+# This file is copied to the ROOT of the release bundle by the CI build job.
+# Hooks run as root; the app itself runs as the unprivileged `backend` user.
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /opt/backend/incoming
+file_exists_behavior: OVERWRITE
+hooks:
+  ApplicationStop:        # runs the PREVIOUS revision's script
+    - location: scripts/application_stop.sh
+      timeout: 60
+  BeforeInstall:
+    - location: scripts/before_install.sh
+      timeout: 60
+  AfterInstall:
+    - location: scripts/after_install.sh
+      timeout: 120
+  ApplicationStart:
+    - location: scripts/application_start.sh
+      timeout: 60
+  ValidateService:        # failure here fails the deployment => automatic rollback
+    - location: scripts/validate_service.sh
+      timeout: 120
